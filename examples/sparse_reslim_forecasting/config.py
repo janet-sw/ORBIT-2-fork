@@ -57,6 +57,7 @@ class ForecastConfig:
     keep_ratio: float
     num_dense_early: int
     num_sparse_middle: int
+    token_dropping: bool
 
     parallelism: Mapping[str, int]
     tiling: Mapping[str, Any]
@@ -84,6 +85,12 @@ def _positive_int(value: Any, name: str, *, allow_zero: bool = False) -> int:
     if value < minimum:
         qualifier = "non-negative" if allow_zero else "positive"
         raise ConfigError(f"{name} must be {qualifier}")
+    return value
+
+
+def _boolean(value: Any, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigError(f"{name} must be true or false")
     return value
 
 
@@ -193,6 +200,10 @@ def load_forecast_config(path: str | os.PathLike[str]) -> ForecastConfig:
     keep_ratio = float(_required(model, "keep_ratio", "model"))
     if not 0 < keep_ratio <= 1:
         raise ConfigError("model.keep_ratio must be in (0, 1]")
+    token_dropping = _boolean(
+        _required(model, "token_dropping", "model"),
+        "model.token_dropping",
+    )
 
     validated_parallelism = {
         key: _positive_int(
@@ -200,9 +211,9 @@ def load_forecast_config(path: str | os.PathLike[str]) -> ForecastConfig:
         )
         for key in ("fsdp", "simple_ddp", "tensor_par", "seq_par")
     }
-    do_tiling = _required(tiling, "do_tiling", "tiling")
-    if not isinstance(do_tiling, bool):
-        raise ConfigError("tiling.do_tiling must be true or false")
+    do_tiling = _boolean(
+        _required(tiling, "do_tiling", "tiling"), "tiling.do_tiling"
+    )
     validated_tiling = {
         "do_tiling": do_tiling,
         "div": _positive_int(_required(tiling, "div", "tiling"), "tiling.div"),
@@ -212,11 +223,22 @@ def load_forecast_config(path: str | os.PathLike[str]) -> ForecastConfig:
             allow_zero=True,
         ),
     }
-    validated_compression = {
-        "compress_ratio": _positive_int(
-            _required(compression, "compress_ratio", "compression"),
-            "compression.compress_ratio",
+    compression_enabled = _boolean(
+        _required(compression, "enabled", "compression"),
+        "compression.enabled",
+    )
+    compress_ratio = _positive_int(
+        _required(compression, "compress_ratio", "compression"),
+        "compression.compress_ratio",
+    )
+    if compression_enabled and compress_ratio == 1:
+        raise ConfigError(
+            "compression.compress_ratio must be greater than 1 when "
+            "compression is enabled"
         )
+    validated_compression = {
+        "enabled": compression_enabled,
+        "compress_ratio": compress_ratio,
     }
 
     accelerator = str(trainer.get("accelerator", "auto"))
@@ -292,6 +314,7 @@ def load_forecast_config(path: str | os.PathLike[str]) -> ForecastConfig:
         keep_ratio=keep_ratio,
         num_dense_early=num_dense_early,
         num_sparse_middle=num_sparse_middle,
+        token_dropping=token_dropping,
         parallelism=validated_parallelism,
         tiling=validated_tiling,
         compression=validated_compression,

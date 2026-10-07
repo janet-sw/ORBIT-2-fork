@@ -29,7 +29,9 @@ tiling:
   overlap: 0
 
 compression:
-  compress_ratio: 1
+  enabled: false
+  # Ratio 3 is compatible with the 180 x 360 grid and patch_size 4 below.
+  compress_ratio: 3
 
 model:
   preset: sparse_reslim
@@ -41,6 +43,7 @@ model:
   num_heads: 4
   mlp_ratio: 4.0
   dropout: 0.0
+  token_dropping: true
   keep_ratio: 0.25
   num_dense_early: 1
   num_sparse_middle: 2

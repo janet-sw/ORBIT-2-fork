@@ -31,10 +31,11 @@ tiling:
   overlap: 0
 
 #----------  Reslim Input Data Compression ------------------------------------
-# compress_ratio: 1 keeps the original input resolution. Ratios greater than 1
-# are reserved for the input-compression implementation.
+# Independent from middle-layer token dropping below. When enabled, the input
+# is compressed before patch embedding and decoded back to the original size.
 compression:
-  compress_ratio: 1
+  enabled: false
+  compress_ratio: 2
 
 # ---------------------------- MODEL -------------------------------------------
 model:
@@ -47,6 +48,7 @@ model:
   num_heads: 4
   mlp_ratio: 4.0
   dropout: 0.0
+  token_dropping: true
   keep_ratio: 0.25
   num_dense_early: 1
   num_sparse_middle: 4

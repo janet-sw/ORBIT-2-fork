@@ -155,6 +155,9 @@ def _build_model(args, img_size: tuple[int, int]) -> SparseReslim:
         keep_ratio=args.keep_ratio,
         num_dense_early=args.num_dense_early,
         num_sparse_middle=args.num_sparse_middle,
+        token_dropping=args.token_dropping,
+        compression_enabled=args.compression["enabled"],
+        compress_ratio=args.compression["compress_ratio"],
         dropout=args.dropout,
     )
 
@@ -254,38 +257,50 @@ def _save_checkpoint(
 def run_smoke_test() -> None:
     torch.manual_seed(0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = SparseReslim(
-        variables=("2m_temperature",),
-        output_variables=("2m_temperature",),
-        img_size=(8, 16),
-        patch_size=2,
-        embed_dim=32,
-        depth=4,
-        num_heads=4,
-        keep_ratio=0.25,
-        num_dense_early=1,
-        num_sparse_middle=2,
-    ).to(device)
     inputs = torch.randn(2, 1, 1, 8, 16, device=device)
     targets = torch.randn(2, 1, 8, 16, device=device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    train_mse = _run_epoch(
-        model,
-        [(inputs, targets)],
-        device,
-        "float32",
-        optimizer=optimizer,
+    cases = (
+        ("baseline", False, False, 32, 32),
+        ("compression_only", True, False, 8, 8),
+        ("token_dropping_only", False, True, 32, 8),
+        ("compression_and_token_dropping", True, True, 8, 2),
     )
-    forecast = model(inputs)
-    assert forecast.shape == targets.shape
-    assert model.last_sparse_token_count == 8  # 25% of 32 patch tokens.
-    print(
-        "Smoke test passed:",
-        f"device={device},",
-        f"forecast={tuple(forecast.shape)},",
-        f"sparse_tokens={model.last_sparse_token_count}/{model.num_patches},",
-        f"train_mse={train_mse:.4f}",
-    )
+
+    for name, compression_enabled, token_dropping, num_patches, num_active in cases:
+        model = SparseReslim(
+            variables=("2m_temperature",),
+            output_variables=("2m_temperature",),
+            img_size=(8, 16),
+            patch_size=2,
+            embed_dim=32,
+            depth=4,
+            num_heads=4,
+            keep_ratio=0.25,
+            num_dense_early=1,
+            num_sparse_middle=2,
+            token_dropping=token_dropping,
+            compression_enabled=compression_enabled,
+            compress_ratio=2,
+        ).to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        train_mse = _run_epoch(
+            model,
+            [(inputs, targets)],
+            device,
+            "float32",
+            optimizer=optimizer,
+        )
+        forecast = model(inputs)
+        assert forecast.shape == targets.shape
+        assert model.num_patches == num_patches
+        assert model.last_sparse_token_count == num_active
+        print(
+            f"Smoke test passed ({name}):",
+            f"device={device},",
+            f"forecast={tuple(forecast.shape)},",
+            f"active_tokens={model.last_sparse_token_count}/{model.num_patches},",
+            f"train_mse={train_mse:.4f}",
+        )
 
 
 def run_training(args) -> None:
@@ -298,9 +313,25 @@ def run_training(args) -> None:
     seed_everything(args.seed)
     root = args.era5_dir.expanduser().resolve()
     img_size = _infer_image_size(root, args.input_vars[0])
-    if img_size[0] % args.patch_size or img_size[1] % args.patch_size:
+    compress_ratio = (
+        args.compression["compress_ratio"] if args.compression["enabled"] else 1
+    )
+    if img_size[0] % compress_ratio or img_size[1] % compress_ratio:
         raise SystemExit(
-            f"Image size {img_size} is not divisible by patch size {args.patch_size}"
+            f"Image size {img_size} is not divisible by compression ratio "
+            f"{compress_ratio}"
+        )
+    compressed_img_size = (
+        img_size[0] // compress_ratio,
+        img_size[1] // compress_ratio,
+    )
+    if (
+        compressed_img_size[0] % args.patch_size
+        or compressed_img_size[1] % args.patch_size
+    ):
+        raise SystemExit(
+            f"Compressed image size {compressed_img_size} is not divisible by "
+            f"patch size {args.patch_size}"
         )
 
     common_dataset_args = dict(
@@ -353,7 +384,18 @@ def run_training(args) -> None:
         )
         print(f"Resuming at epoch {start_epoch + 1}", flush=True)
 
-    print(f"Training on {device} with native PyTorch", flush=True)
+    active_tokens = network.num_patches
+    if args.token_dropping and args.num_sparse_middle:
+        active_tokens = max(1, int(network.num_patches * args.keep_ratio))
+    print(
+        f"Training on {device} with native PyTorch | "
+        f"compression={'on' if args.compression['enabled'] else 'off'} "
+        f"(ratio={compress_ratio}) | "
+        f"token_dropping={'on' if args.token_dropping else 'off'} "
+        f"(keep_ratio={args.keep_ratio}, "
+        f"active_tokens={active_tokens}/{network.num_patches})",
+        flush=True,
+    )
     for epoch in range(start_epoch, args.max_epochs):
         train_mse = _run_epoch(
             network,

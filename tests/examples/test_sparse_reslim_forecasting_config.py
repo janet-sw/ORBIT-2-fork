@@ -32,7 +32,8 @@ def test_load_default_forecasting_config():
     assert config.limit_train_batches is None
     assert config.limit_val_batches is None
     assert config.limit_test_batches is None
-    assert config.compression["compress_ratio"] == 1
+    assert config.compression == {"enabled": False, "compress_ratio": 2}
+    assert config.token_dropping is True
     assert config.keep_ratio == 0.25
 
 
@@ -55,4 +56,34 @@ def test_rejects_output_variable_missing_from_inputs(tmp_path):
     path.write_text(yaml.safe_dump(invalid), encoding="utf-8")
 
     with pytest.raises(forecast_config.ConfigError, match="residual path"):
+        forecast_config.load_forecast_config(path)
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "match"),
+    (
+        ("compression", "enabled", "compression.enabled"),
+        ("model", "token_dropping", "model.token_dropping"),
+    ),
+)
+def test_rejects_non_boolean_feature_switch(tmp_path, section, key, match):
+    raw = yaml.safe_load(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
+    invalid = deepcopy(raw)
+    invalid[section][key] = "false"
+    path = tmp_path / "invalid.yaml"
+    path.write_text(yaml.safe_dump(invalid), encoding="utf-8")
+
+    with pytest.raises(forecast_config.ConfigError, match=match):
+        forecast_config.load_forecast_config(path)
+
+
+def test_rejects_enabled_noop_compression(tmp_path):
+    raw = yaml.safe_load(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
+    invalid = deepcopy(raw)
+    invalid["compression"]["enabled"] = True
+    invalid["compression"]["compress_ratio"] = 1
+    path = tmp_path / "invalid.yaml"
+    path.write_text(yaml.safe_dump(invalid), encoding="utf-8")
+
+    with pytest.raises(forecast_config.ConfigError, match="compress_ratio"):
         forecast_config.load_forecast_config(path)

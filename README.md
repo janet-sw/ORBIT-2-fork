@@ -410,6 +410,12 @@ single-step 120-hour T2m forecast with a Sparse-Reslim keep ratio of 0.25.
 The best validation checkpoint is saved under
 `outputs/sparse_reslim_forecasting/checkpoints/best.pt`.
 
+Input compression and middle-layer token dropping are independent options.
+Set `compression.enabled` and `model.token_dropping` in the YAML to test either
+method alone, both together, or the dense baseline. Use a separate
+`trainer.output_dir` for each architecture because their checkpoints are not
+interchangeable.
+
 To use another forecasting configuration, set `CONFIG_PATH` when submitting:
 ```
 CONFIG_PATH=/path/to/forecast.yaml sbatch examples/sparse_reslim_forecasting/launch.sh
