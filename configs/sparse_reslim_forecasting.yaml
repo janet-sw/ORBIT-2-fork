@@ -19,10 +19,13 @@ trainer:
 
 #----------  Parallelism and Efficient Computing -------------------------------
 parallelism:
+  # Product of these four dimensions must equal trainer.devices and Slurm tasks.
+  # fsdp > 1: FULL_SHARD; simple_ddp > 1: DDP; both > 1: HYBRID_SHARD.
   fsdp: 1
   simple_ddp: 1
   tensor_par: 1
   seq_par: 1
+  activation_checkpointing: true
 
 #----------  TILES -------------------------------------------------------------
 # div and overlap are ready for the 180 x 360 grid; toggle do_tiling to enable.

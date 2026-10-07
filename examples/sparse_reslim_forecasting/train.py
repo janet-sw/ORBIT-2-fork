@@ -9,16 +9,37 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+from torch.distributed.fsdp import (
+    FullOptimStateDictConfig,
+    FullStateDictConfig,
+    FullyShardedDataParallel as FSDP,
+    StateDictType,
+)
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 try:
     from .config import ConfigError, load_forecast_config
+    from .distributed import (
+        DistributedContext,
+        cleanup_distributed,
+        initialize_distributed,
+        unwrap_model,
+        wrap_model,
+    )
     from .model import SparseReslim
     from .tiling import build_tile_specs, extract_tile, stitch_tiles
     from .utils import seed_everything
 except ImportError:  # Support `python examples/.../train.py` from the repo root.
     from config import ConfigError, load_forecast_config
+    from distributed import (
+        DistributedContext,
+        cleanup_distributed,
+        initialize_distributed,
+        unwrap_model,
+        wrap_model,
+    )
     from model import SparseReslim
     from tiling import build_tile_specs, extract_tile, stitch_tiles
     from utils import seed_everything
@@ -74,6 +95,8 @@ class ERA5ForecastDataset(IterableDataset):
         do_tiling: bool = False,
         tile_div: int = 1,
         tile_overlap: int = 0,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> None:
         super().__init__()
         self.files = sorted((root / split).glob("*.npz"))
@@ -90,9 +113,14 @@ class ERA5ForecastDataset(IterableDataset):
         self.do_tiling = do_tiling
         self.tile_div = tile_div
         self.tile_overlap = tile_overlap
+        self.rank = rank
+        self.world_size = world_size
 
     def __iter__(self):
         files = list(self.files)
+        if self.world_size > 1 and len(files) >= self.world_size:
+            usable_files = len(files) // self.world_size * self.world_size
+            files = files[:usable_files][self.rank :: self.world_size]
         if self.shuffle_files:
             random.shuffle(files)
         worker = get_worker_info()
@@ -216,7 +244,7 @@ def _autocast_context(device: torch.device, data_type: str):
 
 
 def _run_epoch(
-    model: SparseReslim,
+    model,
     loader,
     device: torch.device,
     data_type: str,
@@ -252,41 +280,93 @@ def _run_epoch(
             total_loss += float(loss.detach()) * batch_size
             total_samples += batch_size
 
+    if dist.is_available() and dist.is_initialized():
+        totals = torch.tensor(
+            [total_loss, total_samples], dtype=torch.float64, device=device
+        )
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+        total_loss = float(totals[0].item())
+        total_samples = int(totals[1].item())
     if total_samples == 0:
         raise RuntimeError("The data loader did not produce any forecast samples")
     return total_loss / total_samples
 
 
-def _load_checkpoint(path: Path, model, optimizer=None):
+def _load_checkpoint(
+    path: Path,
+    model,
+    optimizer=None,
+    context: DistributedContext | None = None,
+):
     if not path.exists():
         raise FileNotFoundError(f"Checkpoint does not exist: {path}")
     checkpoint = torch.load(path, map_location="cpu")
     state_dict = checkpoint.get("model_state_dict", checkpoint)
-    model.load_state_dict(state_dict)
-    if optimizer is not None and "optimizer_state_dict" in checkpoint:
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    if context is not None and context.uses_fsdp:
+        load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
+        with FSDP.state_dict_type(
+            model, StateDictType.FULL_STATE_DICT, load_policy
+        ):
+            model.load_state_dict(state_dict)
+        if optimizer is not None and "optimizer_state_dict" in checkpoint:
+            optimizer_state = FSDP.optim_state_dict_to_load(
+                model, optimizer, checkpoint["optimizer_state_dict"]
+            )
+            optimizer.load_state_dict(optimizer_state)
+    else:
+        unwrap_model(model).load_state_dict(state_dict)
+        if optimizer is not None and "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     return checkpoint
 
 
 def _save_checkpoint(
     path: Path,
-    model: SparseReslim,
+    model,
     optimizer: torch.optim.Optimizer,
     epoch: int,
     best_val_mse: float,
     epochs_without_improvement: int,
+    context: DistributedContext,
 ) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "best_val_mse": best_val_mse,
-            "epochs_without_improvement": epochs_without_improvement,
-        },
-        path,
-    )
+    if context.is_main:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    if context.distributed:
+        barrier_devices = (
+            [context.local_rank] if context.device.type == "cuda" else None
+        )
+        dist.barrier(device_ids=barrier_devices)
+
+    if context.uses_fsdp:
+        model_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        optimizer_policy = FullOptimStateDictConfig(
+            offload_to_cpu=True, rank0_only=True
+        )
+        with FSDP.state_dict_type(
+            model,
+            StateDictType.FULL_STATE_DICT,
+            model_policy,
+            optimizer_policy,
+        ):
+            model_state = model.state_dict()
+            optimizer_state = FSDP.optim_state_dict(model, optimizer)
+    else:
+        model_state = unwrap_model(model).state_dict()
+        optimizer_state = optimizer.state_dict()
+
+    if context.is_main:
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state_dict": model_state,
+                "optimizer_state_dict": optimizer_state,
+                "best_val_mse": best_val_mse,
+                "epochs_without_improvement": epochs_without_improvement,
+            },
+            path,
+        )
+    if context.distributed:
+        dist.barrier(device_ids=barrier_devices)
 
 
 def run_smoke_test() -> None:
@@ -388,14 +468,9 @@ def run_smoke_test() -> None:
     )
 
 
-def run_training(args) -> None:
-    if args.devices != 1:
-        raise SystemExit(
-            "This native PyTorch example currently supports one device. "
-            "DDP and FSDP will be added as separate parallelism work."
-        )
-    device = _select_device(args.accelerator)
-    seed_everything(args.seed)
+def _run_training(args, context: DistributedContext) -> None:
+    device = context.device
+    seed_everything(args.seed + context.rank)
     root = args.era5_dir.expanduser().resolve()
     full_img_size = _infer_image_size(root, args.input_vars[0])
     try:
@@ -433,6 +508,8 @@ def run_training(args) -> None:
         do_tiling=args.tiling["do_tiling"],
         tile_div=args.tiling["div"],
         tile_overlap=args.tiling["overlap"],
+        rank=context.rank,
+        world_size=context.world_size,
     )
     train_dataset = ERA5ForecastDataset(
         split="train", shuffle_files=True, **common_dataset_args
@@ -452,7 +529,12 @@ def run_training(args) -> None:
             pin_memory=device.type == "cuda",
         )
 
-    network = _build_model(args, img_size).to(device)
+    raw_network = _build_model(args, img_size)
+    active_tokens = raw_network.num_patches
+    if args.token_dropping and args.num_sparse_middle:
+        active_tokens = max(1, int(raw_network.num_patches * args.keep_ratio))
+    num_patches = raw_network.num_patches
+    network = wrap_model(raw_network, args, context)
     optimizer = torch.optim.AdamW(
         network.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
@@ -463,34 +545,42 @@ def run_training(args) -> None:
     epochs_without_improvement = 0
 
     if args.pretrain:
-        _load_checkpoint(Path(args.pretrain).expanduser(), network)
-        print(f"Loaded pretrained weights from {args.pretrain}", flush=True)
+        _load_checkpoint(
+            Path(args.pretrain).expanduser(), network, context=context
+        )
+        if context.is_main:
+            print(f"Loaded pretrained weights from {args.pretrain}", flush=True)
     if args.checkpoint:
         checkpoint = _load_checkpoint(
-            Path(args.checkpoint).expanduser(), network, optimizer
+            Path(args.checkpoint).expanduser(),
+            network,
+            optimizer,
+            context,
         )
         start_epoch = int(checkpoint.get("epoch", -1)) + 1
         best_val_mse = float(checkpoint.get("best_val_mse", best_val_mse))
         epochs_without_improvement = int(
             checkpoint.get("epochs_without_improvement", 0)
         )
-        print(f"Resuming at epoch {start_epoch + 1}", flush=True)
+        if context.is_main:
+            print(f"Resuming at epoch {start_epoch + 1}", flush=True)
 
-    active_tokens = network.num_patches
-    if args.token_dropping and args.num_sparse_middle:
-        active_tokens = max(1, int(network.num_patches * args.keep_ratio))
-    print(
-        f"Training on {device} with native PyTorch | "
-        f"tiling={'on' if args.tiling['do_tiling'] else 'off'} "
-        f"(div={args.tiling['div']}, overlap={args.tiling['overlap']}, "
-        f"tile={img_size}) | "
-        f"compression={'on' if args.compression['enabled'] else 'off'} "
-        f"(ratio={compress_ratio}) | "
-        f"token_dropping={'on' if args.token_dropping else 'off'} "
-        f"(keep_ratio={args.keep_ratio}, "
-        f"active_tokens={active_tokens}/{network.num_patches})",
-        flush=True,
-    )
+    if context.is_main:
+        print(
+            f"Training on {device} with native PyTorch | "
+            f"parallelism={context.mode} ({context.world_size} processes) | "
+            f"activation_checkpointing="
+            f"{'on' if args.parallelism['activation_checkpointing'] else 'off'} | "
+            f"tiling={'on' if args.tiling['do_tiling'] else 'off'} "
+            f"(div={args.tiling['div']}, overlap={args.tiling['overlap']}, "
+            f"tile={img_size}) | "
+            f"compression={'on' if args.compression['enabled'] else 'off'} "
+            f"(ratio={compress_ratio}) | "
+            f"token_dropping={'on' if args.token_dropping else 'off'} "
+            f"(keep_ratio={args.keep_ratio}, "
+            f"active_tokens={active_tokens}/{num_patches})",
+            flush=True,
+        )
     for epoch in range(start_epoch, args.max_epochs):
         train_mse = _run_epoch(
             network,
@@ -507,11 +597,12 @@ def run_training(args) -> None:
             args.data_type,
             max_batches=args.limit_val_batches,
         )
-        print(
-            f"Epoch {epoch + 1:03d}/{args.max_epochs:03d} "
-            f"train/mse={train_mse:.6f} val/mse={val_mse:.6f}",
-            flush=True,
-        )
+        if context.is_main:
+            print(
+                f"Epoch {epoch + 1:03d}/{args.max_epochs:03d} "
+                f"train/mse={train_mse:.6f} val/mse={val_mse:.6f}",
+                flush=True,
+            )
 
         if val_mse < best_val_mse:
             best_val_mse = val_mse
@@ -523,16 +614,19 @@ def run_training(args) -> None:
                 epoch,
                 best_val_mse,
                 epochs_without_improvement,
+                context,
             )
-            print(f"Saved best checkpoint to {best_checkpoint}", flush=True)
+            if context.is_main:
+                print(f"Saved best checkpoint to {best_checkpoint}", flush=True)
         else:
             epochs_without_improvement += 1
             if args.patience > 0 and epochs_without_improvement >= args.patience:
-                print(
-                    f"Early stopping after {epochs_without_improvement} "
-                    "epochs without validation improvement",
-                    flush=True,
-                )
+                if context.is_main:
+                    print(
+                        f"Early stopping after {epochs_without_improvement} "
+                        "epochs without validation improvement",
+                        flush=True,
+                    )
                 break
 
     if not best_checkpoint.exists():
@@ -540,7 +634,7 @@ def run_training(args) -> None:
             "Training completed without producing a best checkpoint. "
             "Check max_epochs and checkpoint settings."
         )
-    _load_checkpoint(best_checkpoint, network)
+    _load_checkpoint(best_checkpoint, network, context=context)
     test_mse = _run_epoch(
         network,
         loader(test_dataset),
@@ -548,7 +642,17 @@ def run_training(args) -> None:
         args.data_type,
         max_batches=args.limit_test_batches,
     )
-    print(f"test/mse={test_mse:.6f}", flush=True)
+    if context.is_main:
+        print(f"test/mse={test_mse:.6f}", flush=True)
+
+
+def run_training(args) -> None:
+    context = None
+    try:
+        context = initialize_distributed(args)
+        _run_training(args, context)
+    finally:
+        cleanup_distributed(context)
 
 
 def parse_args(argv=None):

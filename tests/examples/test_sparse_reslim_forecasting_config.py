@@ -34,6 +34,13 @@ def test_load_default_forecasting_config():
     assert config.limit_test_batches is None
     assert config.tiling == {"do_tiling": False, "div": 2, "overlap": 2}
     assert config.compression == {"enabled": False, "compress_ratio": 2}
+    assert config.parallelism == {
+        "fsdp": 1,
+        "simple_ddp": 1,
+        "tensor_par": 1,
+        "seq_par": 1,
+        "activation_checkpointing": True,
+    }
     assert config.token_dropping is True
     assert config.keep_ratio == 0.25
 
@@ -65,6 +72,11 @@ def test_rejects_output_variable_missing_from_inputs(tmp_path):
     (
         ("compression", "enabled", "compression.enabled"),
         ("model", "token_dropping", "model.token_dropping"),
+        (
+            "parallelism",
+            "activation_checkpointing",
+            "parallelism.activation_checkpointing",
+        ),
     ),
 )
 def test_rejects_non_boolean_feature_switch(tmp_path, section, key, match):
@@ -99,4 +111,27 @@ def test_rejects_enabled_single_tile_grid(tmp_path):
     path.write_text(yaml.safe_dump(invalid), encoding="utf-8")
 
     with pytest.raises(forecast_config.ConfigError, match="tiling.div"):
+        forecast_config.load_forecast_config(path)
+
+
+def test_rejects_parallelism_device_mismatch(tmp_path):
+    raw = yaml.safe_load(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
+    invalid = deepcopy(raw)
+    invalid["parallelism"]["fsdp"] = 2
+    path = tmp_path / "invalid.yaml"
+    path.write_text(yaml.safe_dump(invalid), encoding="utf-8")
+
+    with pytest.raises(forecast_config.ConfigError, match="trainer.devices"):
+        forecast_config.load_forecast_config(path)
+
+
+def test_rejects_unimplemented_tensor_parallelism(tmp_path):
+    raw = yaml.safe_load(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
+    invalid = deepcopy(raw)
+    invalid["trainer"]["devices"] = 2
+    invalid["parallelism"]["tensor_par"] = 2
+    path = tmp_path / "invalid.yaml"
+    path.write_text(yaml.safe_dump(invalid), encoding="utf-8")
+
+    with pytest.raises(forecast_config.ConfigError, match="tensor_par=1"):
         forecast_config.load_forecast_config(path)

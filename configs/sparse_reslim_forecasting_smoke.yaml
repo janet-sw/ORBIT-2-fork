@@ -22,6 +22,7 @@ parallelism:
   simple_ddp: 1
   tensor_par: 1
   seq_par: 1
+  activation_checkpointing: false
 
 tiling:
   do_tiling: false

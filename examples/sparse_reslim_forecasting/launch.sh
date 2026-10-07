@@ -2,8 +2,8 @@
 #SBATCH -A lrn036
 #SBATCH -J sparse-reslim-forecast
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:1
 #SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=7
 #SBATCH -t 01:00:00
 #SBATCH -q debug
@@ -22,6 +22,12 @@ export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-7}"
 export PYTHONNOUSERSITE=1
 mkdir -p "${MIOPEN_USER_DB_PATH}"
 
+if [[ "${SLURM_NTASKS:-1}" -gt 1 ]]; then
+  MASTER_HOST="$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n 1)"
+  export MASTER_ADDR="${MASTER_ADDR:-${MASTER_HOST}}"
+  export MASTER_PORT="${MASTER_PORT:-29500}"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 REPO_ROOT="${REPO_ROOT:-${SLURM_SUBMIT_DIR:-${DEFAULT_REPO_ROOT}}}"
@@ -34,4 +40,5 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
 fi
 
 cd "${REPO_ROOT}"
-srun "${PYTHON_BIN}" examples/sparse_reslim_forecasting/train.py "${CONFIG_PATH}"
+srun --kill-on-bad-exit=1 \
+  "${PYTHON_BIN}" examples/sparse_reslim_forecasting/train.py "${CONFIG_PATH}"

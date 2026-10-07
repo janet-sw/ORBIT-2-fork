@@ -422,6 +422,23 @@ processes every tile and crops the overlap before stitching a full-resolution
 forecast. The YAML values are chosen so enabling the switch is compatible with
 the configured ERA5 grid, compression ratio, and patch size.
 
+Native PyTorch distributed training is controlled by `trainer.devices` and the
+`parallelism` section. Their process counts must agree with the Slurm task
+count. `simple_ddp > 1` selects DDP, `fsdp > 1` selects FSDP `FULL_SHARD`, and
+using both selects FSDP `HYBRID_SHARD`. Transformer activation checkpointing is
+an independent YAML switch. For example, after setting `trainer.devices: 2`
+and `parallelism.fsdp: 2`, launch a two-GPU smoke run with:
+
+```bash
+sbatch --nodes=1 --ntasks-per-node=2 --gpus-per-node=2 \
+  examples/sparse_reslim_forecasting/launch.sh
+```
+
+Each process receives a disjoint subset of ERA5 files. Metrics are reduced
+across ranks, while FSDP checkpoints are gathered to a portable full state dict
+and written only by rank zero. `trainer.batch_size` is per process, so the
+effective global batch size is `batch_size * trainer.devices`.
+
 To use another forecasting configuration, set `CONFIG_PATH` when submitting:
 ```
 CONFIG_PATH=/path/to/forecast.yaml sbatch examples/sparse_reslim_forecasting/launch.sh

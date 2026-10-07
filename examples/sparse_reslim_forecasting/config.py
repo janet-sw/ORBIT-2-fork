@@ -59,7 +59,7 @@ class ForecastConfig:
     num_sparse_middle: int
     token_dropping: bool
 
-    parallelism: Mapping[str, int]
+    parallelism: Mapping[str, Any]
     tiling: Mapping[str, Any]
     compression: Mapping[str, Any]
     smoke_test: bool = False
@@ -211,6 +211,18 @@ def load_forecast_config(path: str | os.PathLike[str]) -> ForecastConfig:
         )
         for key in ("fsdp", "simple_ddp", "tensor_par", "seq_par")
     }
+    validated_parallelism["activation_checkpointing"] = _boolean(
+        parallelism.get("activation_checkpointing", False),
+        "parallelism.activation_checkpointing",
+    )
+    if (
+        validated_parallelism["tensor_par"] != 1
+        or validated_parallelism["seq_par"] != 1
+    ):
+        raise ConfigError(
+            "The forecasting example currently requires parallelism.tensor_par=1 "
+            "and parallelism.seq_par=1"
+        )
     do_tiling = _boolean(
         _required(tiling, "do_tiling", "tiling"), "tiling.do_tiling"
     )
@@ -255,6 +267,19 @@ def load_forecast_config(path: str | os.PathLike[str]) -> ForecastConfig:
     if trainer.get("checkpoint") and trainer.get("pretrain"):
         raise ConfigError("Set only one of trainer.checkpoint or trainer.pretrain")
 
+    devices = _positive_int(trainer.get("devices", 1), "trainer.devices")
+    expected_devices = (
+        validated_parallelism["fsdp"]
+        * validated_parallelism["simple_ddp"]
+        * validated_parallelism["tensor_par"]
+        * validated_parallelism["seq_par"]
+    )
+    if devices != expected_devices:
+        raise ConfigError(
+            f"trainer.devices={devices}, but parallelism requires "
+            f"{expected_devices} processes"
+        )
+
     batch_limits = {}
     for stage in ("train", "val", "test"):
         key = f"limit_{stage}_batches"
@@ -288,7 +313,7 @@ def load_forecast_config(path: str | os.PathLike[str]) -> ForecastConfig:
             trainer.get("patience", 0), "trainer.patience", allow_zero=True
         ),
         accelerator=accelerator,
-        devices=_positive_int(trainer.get("devices", 1), "trainer.devices"),
+        devices=devices,
         output_dir=_expand_path(
             trainer.get("output_dir", "outputs/sparse_reslim_forecasting"),
             "trainer.output_dir",
