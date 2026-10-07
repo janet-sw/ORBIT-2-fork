@@ -464,18 +464,14 @@ CONFIG_PATH=configs/sparse_reslim_forecasting_smoke.yaml \
 The figure is saved under
 `outputs/sparse_reslim_forecasting_smoke/visualizations/` by default.
 
-### Full Sparse-Reslim Implementation
+### Full Sparse-Reslim implementation
 
-### Weather Forecasting Extension Work 
-This example is intended as a minimal demonstration of weather forecasting within the ORBIT-2 repository using the ORBIT-2 AI architecture innovation reslim and tiling algorithm. For additional weather forecasting implementation based on ORBIT-2, including:
-
-Multi-variable forecasting experiments
-Distributed training
-EDM probabilistic forecasting
-Additional forecasting configurations and experiments
-Sparse Residual Routing for Architecture Token Dropping
-
-see the ECCV paper repository (https://github.com/janet-sw/Sparse-Reslim) , which contains the implementation used for the related ECCV weather forecasting work.
+This example is a compact deterministic forecasting workflow built around the
+ORBIT-2 Reslim and TILES components. The
+[ECCV Sparse-Reslim repository](https://github.com/janet-sw/Sparse-Reslim)
+contains the complete research implementation, including multi-variable
+experiments, EDM probabilistic forecasting, paper configurations, and the
+Sparse Residual Routing experiments.
 
 
 ## Citation
