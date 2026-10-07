@@ -29,6 +29,9 @@ def test_load_default_forecasting_config():
     assert config.history == 1
     assert config.window == 1
     assert config.pred_range == 120
+    assert config.limit_train_batches is None
+    assert config.limit_val_batches is None
+    assert config.limit_test_batches is None
     assert config.compression["compress_ratio"] == 1
     assert config.keep_ratio == 0.25
 

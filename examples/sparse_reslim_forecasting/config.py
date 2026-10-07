@@ -36,6 +36,8 @@ class ForecastConfig:
     devices: int
     output_dir: Path
     limit_train_batches: int | None
+    limit_val_batches: int | None
+    limit_test_batches: int | None
     seed: int
     checkpoint: str | None
     pretrain: str | None
@@ -220,12 +222,22 @@ def load_forecast_config(path: str | os.PathLike[str]) -> ForecastConfig:
     accelerator = str(trainer.get("accelerator", "auto"))
     if accelerator not in {"auto", "cpu", "gpu"}:
         raise ConfigError("trainer.accelerator must be one of: auto, cpu, gpu")
+    data_type = str(_required(trainer, "data_type", "trainer"))
+    if data_type not in {"bfloat16", "float32"}:
+        raise ConfigError("trainer.data_type must be one of: bfloat16, float32")
+    train_loss = str(_required(trainer, "train_loss", "trainer"))
+    if train_loss != "mse":
+        raise ConfigError("The forecasting example currently supports train_loss: mse")
+    if trainer.get("checkpoint") and trainer.get("pretrain"):
+        raise ConfigError("Set only one of trainer.checkpoint or trainer.pretrain")
 
-    limit_train_batches = trainer.get("limit_train_batches")
-    if limit_train_batches is not None:
-        limit_train_batches = _positive_int(
-            limit_train_batches, "trainer.limit_train_batches"
-        )
+    batch_limits = {}
+    for stage in ("train", "val", "test"):
+        key = f"limit_{stage}_batches"
+        value = trainer.get(key)
+        if value is not None:
+            value = _positive_int(value, f"trainer.{key}")
+        batch_limits[key] = value
 
     return ForecastConfig(
         config_path=config_path,
@@ -257,13 +269,15 @@ def load_forecast_config(path: str | os.PathLike[str]) -> ForecastConfig:
             trainer.get("output_dir", "outputs/sparse_reslim_forecasting"),
             "trainer.output_dir",
         ),
-        limit_train_batches=limit_train_batches,
+        limit_train_batches=batch_limits["limit_train_batches"],
+        limit_val_batches=batch_limits["limit_val_batches"],
+        limit_test_batches=batch_limits["limit_test_batches"],
         seed=_positive_int(trainer.get("seed", 0), "trainer.seed", allow_zero=True),
         checkpoint=trainer.get("checkpoint"),
         pretrain=trainer.get("pretrain"),
-        data_type=str(_required(trainer, "data_type", "trainer")),
+        data_type=data_type,
         gpu_type=str(_required(trainer, "gpu_type", "trainer")),
-        train_loss=str(_required(trainer, "train_loss", "trainer")),
+        train_loss=train_loss,
         preset=str(_required(model, "preset", "model")),
         lr=float(_required(model, "lr", "model")),
         weight_decay=float(_required(model, "weight_decay", "model")),

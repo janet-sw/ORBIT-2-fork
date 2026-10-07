@@ -405,11 +405,20 @@ To run the forecasting example on one GPU:
 ```
 sbatch examples/sparse_reslim_forecasting/launch.sh
 ```
-The launch script runs a 30-epoch, single-step 120-hour T2m forecast using a Sparse-Reslim keep ratio of 0.25.
+The launch script uses a native PyTorch training loop to run a 30-epoch,
+single-step 120-hour T2m forecast with a Sparse-Reslim keep ratio of 0.25.
+The best validation checkpoint is saved under
+`outputs/sparse_reslim_forecasting/checkpoints/best.pt`.
 
 To use another forecasting configuration, set `CONFIG_PATH` when submitting:
 ```
 CONFIG_PATH=/path/to/forecast.yaml sbatch examples/sparse_reslim_forecasting/launch.sh
+```
+
+To check the complete input-to-checkpoint pipeline using one train, validation,
+and test batch on Frontier:
+```
+CONFIG_PATH=configs/sparse_reslim_forecasting_smoke.yaml sbatch examples/sparse_reslim_forecasting/launch.sh
 ```
 
 For a quick sanity check:

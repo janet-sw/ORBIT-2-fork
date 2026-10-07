@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import random
 from pathlib import Path
 
@@ -14,9 +15,11 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 try:
     from .config import ConfigError, load_forecast_config
     from .model import SparseReslim
+    from .utils import seed_everything
 except ImportError:  # Support `python examples/.../train.py` from the repo root.
     from config import ConfigError, load_forecast_config
     from model import SparseReslim
+    from utils import seed_everything
 
 
 def _as_time_lat_lon(array: np.ndarray, variable: str) -> np.ndarray:
@@ -148,14 +151,109 @@ def _build_model(args, img_size: tuple[int, int]) -> SparseReslim:
         embed_dim=args.embed_dim,
         depth=args.depth,
         num_heads=args.num_heads,
+        mlp_ratio=args.mlp_ratio,
         keep_ratio=args.keep_ratio,
         num_dense_early=args.num_dense_early,
         num_sparse_middle=args.num_sparse_middle,
+        dropout=args.dropout,
+    )
+
+
+def _select_device(accelerator: str) -> torch.device:
+    if accelerator == "cpu":
+        return torch.device("cpu")
+    if accelerator == "gpu":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "trainer.accelerator is 'gpu', but PyTorch cannot access a GPU"
+            )
+        return torch.device("cuda")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _autocast_context(device: torch.device, data_type: str):
+    if device.type == "cuda" and data_type == "bfloat16":
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return nullcontext()
+
+
+def _run_epoch(
+    model: SparseReslim,
+    loader,
+    device: torch.device,
+    data_type: str,
+    *,
+    optimizer: torch.optim.Optimizer | None = None,
+    max_batches: int | None = None,
+) -> float:
+    training = optimizer is not None
+    model.train(training)
+    total_loss = 0.0
+    total_samples = 0
+
+    grad_context = torch.enable_grad() if training else torch.no_grad()
+    with grad_context:
+        for batch_index, (inputs, targets) in enumerate(loader):
+            if max_batches is not None and batch_index >= max_batches:
+                break
+            inputs = inputs.to(device, non_blocking=device.type == "cuda")
+            targets = targets.to(device, non_blocking=device.type == "cuda")
+
+            if training:
+                optimizer.zero_grad(set_to_none=True)
+            with _autocast_context(device, data_type):
+                forecast = model(inputs)
+                loss = F.mse_loss(forecast, targets)
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Encountered non-finite MSE loss: {loss.item()}")
+            if training:
+                loss.backward()
+                optimizer.step()
+
+            batch_size = int(inputs.shape[0])
+            total_loss += float(loss.detach()) * batch_size
+            total_samples += batch_size
+
+    if total_samples == 0:
+        raise RuntimeError("The data loader did not produce any forecast samples")
+    return total_loss / total_samples
+
+
+def _load_checkpoint(path: Path, model, optimizer=None):
+    if not path.exists():
+        raise FileNotFoundError(f"Checkpoint does not exist: {path}")
+    checkpoint = torch.load(path, map_location="cpu")
+    state_dict = checkpoint.get("model_state_dict", checkpoint)
+    model.load_state_dict(state_dict)
+    if optimizer is not None and "optimizer_state_dict" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    return checkpoint
+
+
+def _save_checkpoint(
+    path: Path,
+    model: SparseReslim,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    best_val_mse: float,
+    epochs_without_improvement: int,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "best_val_mse": best_val_mse,
+            "epochs_without_improvement": epochs_without_improvement,
+        },
+        path,
     )
 
 
 def run_smoke_test() -> None:
     torch.manual_seed(0)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = SparseReslim(
         variables=("2m_temperature",),
         output_variables=("2m_temperature",),
@@ -167,34 +265,37 @@ def run_smoke_test() -> None:
         keep_ratio=0.25,
         num_dense_early=1,
         num_sparse_middle=2,
+    ).to(device)
+    inputs = torch.randn(2, 1, 1, 8, 16, device=device)
+    targets = torch.randn(2, 1, 8, 16, device=device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    train_mse = _run_epoch(
+        model,
+        [(inputs, targets)],
+        device,
+        "float32",
+        optimizer=optimizer,
     )
-    inputs = torch.randn(2, 1, 1, 8, 16, requires_grad=True)
-    targets = torch.randn(2, 1, 8, 16)
     forecast = model(inputs)
-    loss = F.mse_loss(forecast, targets)
-    loss.backward()
     assert forecast.shape == targets.shape
     assert model.last_sparse_token_count == 8  # 25% of 32 patch tokens.
     print(
         "Smoke test passed:",
+        f"device={device},",
         f"forecast={tuple(forecast.shape)},",
         f"sparse_tokens={model.last_sparse_token_count}/{model.num_patches},",
-        f"loss={loss.item():.4f}",
+        f"train_mse={train_mse:.4f}",
     )
 
 
 def run_training(args) -> None:
-    try:
-        import pytorch_lightning as pl
-        from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
-    except ImportError as error:
+    if args.devices != 1:
         raise SystemExit(
-            "PyTorch Lightning is required for training. Run `pip install -e .` "
-            "from the ORBIT-2 repository root."
-        ) from error
-
-    if args.era5_dir is None:
-        raise SystemExit("ERA5_DIR is required unless --smoke-test is used")
+            "This native PyTorch example currently supports one device. "
+            "DDP and FSDP will be added as separate parallelism work."
+        )
+    device = _select_device(args.accelerator)
+    seed_everything(args.seed)
     root = args.era5_dir.expanduser().resolve()
     img_size = _infer_image_size(root, args.input_vars[0])
     if img_size[0] % args.patch_size or img_size[1] % args.patch_size:
@@ -225,73 +326,92 @@ def run_training(args) -> None:
             dataset,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
-            pin_memory=args.accelerator != "cpu",
+            pin_memory=device.type == "cuda",
         )
 
-    network = _build_model(args, img_size)
-
-    class ForecastModule(pl.LightningModule):
-        def __init__(self, net: SparseReslim):
-            super().__init__()
-            self.net = net
-
-        def forward(self, inputs):
-            return self.net(inputs)
-
-        def _shared_step(self, batch, stage: str):
-            inputs, targets = batch
-            loss = F.mse_loss(self(inputs), targets)
-            self.log(
-                f"{stage}/mse",
-                loss,
-                prog_bar=True,
-                on_step=stage == "train",
-                on_epoch=True,
-            )
-            return loss
-
-        def training_step(self, batch, batch_idx):
-            return self._shared_step(batch, "train")
-
-        def validation_step(self, batch, batch_idx):
-            self._shared_step(batch, "val")
-
-        def test_step(self, batch, batch_idx):
-            self._shared_step(batch, "test")
-
-        def configure_optimizers(self):
-            return torch.optim.AdamW(
-                self.parameters(), lr=args.lr, weight_decay=args.weight_decay
-            )
-
-    pl.seed_everything(args.seed, workers=True)
+    network = _build_model(args, img_size).to(device)
+    optimizer = torch.optim.AdamW(
+        network.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    )
     output_dir = args.output_dir.expanduser().resolve()
-    checkpoint = ModelCheckpoint(
-        dirpath=output_dir / "checkpoints",
-        monitor="val/mse",
-        mode="min",
-        filename="epoch-{epoch:03d}",
-        auto_insert_metric_name=False,
-        save_top_k=1,
-    )
-    callbacks = [checkpoint]
-    if args.patience > 0:
-        callbacks.append(EarlyStopping(monitor="val/mse", patience=args.patience))
+    best_checkpoint = output_dir / "checkpoints" / "best.pt"
+    start_epoch = 0
+    best_val_mse = float("inf")
+    epochs_without_improvement = 0
 
-    trainer_kwargs = {}
-    if args.limit_train_batches is not None:
-        trainer_kwargs["limit_train_batches"] = args.limit_train_batches
-    trainer = pl.Trainer(
-        accelerator=args.accelerator,
-        devices=args.devices,
-        max_epochs=args.max_epochs,
-        default_root_dir=output_dir,
-        callbacks=callbacks,
-        **trainer_kwargs,
+    if args.pretrain:
+        _load_checkpoint(Path(args.pretrain).expanduser(), network)
+        print(f"Loaded pretrained weights from {args.pretrain}", flush=True)
+    if args.checkpoint:
+        checkpoint = _load_checkpoint(
+            Path(args.checkpoint).expanduser(), network, optimizer
+        )
+        start_epoch = int(checkpoint.get("epoch", -1)) + 1
+        best_val_mse = float(checkpoint.get("best_val_mse", best_val_mse))
+        epochs_without_improvement = int(
+            checkpoint.get("epochs_without_improvement", 0)
+        )
+        print(f"Resuming at epoch {start_epoch + 1}", flush=True)
+
+    print(f"Training on {device} with native PyTorch", flush=True)
+    for epoch in range(start_epoch, args.max_epochs):
+        train_mse = _run_epoch(
+            network,
+            loader(train_dataset),
+            device,
+            args.data_type,
+            optimizer=optimizer,
+            max_batches=args.limit_train_batches,
+        )
+        val_mse = _run_epoch(
+            network,
+            loader(val_dataset),
+            device,
+            args.data_type,
+            max_batches=args.limit_val_batches,
+        )
+        print(
+            f"Epoch {epoch + 1:03d}/{args.max_epochs:03d} "
+            f"train/mse={train_mse:.6f} val/mse={val_mse:.6f}",
+            flush=True,
+        )
+
+        if val_mse < best_val_mse:
+            best_val_mse = val_mse
+            epochs_without_improvement = 0
+            _save_checkpoint(
+                best_checkpoint,
+                network,
+                optimizer,
+                epoch,
+                best_val_mse,
+                epochs_without_improvement,
+            )
+            print(f"Saved best checkpoint to {best_checkpoint}", flush=True)
+        else:
+            epochs_without_improvement += 1
+            if args.patience > 0 and epochs_without_improvement >= args.patience:
+                print(
+                    f"Early stopping after {epochs_without_improvement} "
+                    "epochs without validation improvement",
+                    flush=True,
+                )
+                break
+
+    if not best_checkpoint.exists():
+        raise RuntimeError(
+            "Training completed without producing a best checkpoint. "
+            "Check max_epochs and checkpoint settings."
+        )
+    _load_checkpoint(best_checkpoint, network)
+    test_mse = _run_epoch(
+        network,
+        loader(test_dataset),
+        device,
+        args.data_type,
+        max_batches=args.limit_test_batches,
     )
-    module = ForecastModule(network)
-    trainer.fit(module, train_dataloaders=loader(train_dataset), val_dataloaders=loader(val_dataset))
-    trainer.test(module, dataloaders=loader(test_dataset), ckpt_path="best")
+    print(f"test/mse={test_mse:.6f}", flush=True)
 
 
 def parse_args(argv=None):

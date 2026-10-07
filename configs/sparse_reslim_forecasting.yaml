@@ -13,6 +13,8 @@ trainer:
   devices: 1
   output_dir: outputs/sparse_reslim_forecasting
   limit_train_batches:
+  limit_val_batches:
+  limit_test_batches:
   seed: 0
 
 #----------  Parallelism and Efficient Computing -------------------------------
