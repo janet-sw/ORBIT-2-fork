@@ -395,7 +395,10 @@ The example uses hourly ERA5 data at 1.0-degree resolution available on Frontier
 ```
 /lustre/orion/world-shared/lrn036/jyc/frontier/ClimaX-v2/data/ERA5-1hr-superres/1.0_deg/
 ```
-If you are using a different system, update the data path in the corresponding configuration or launch script.
+The data path, variables, forecast history, history window, forecast range, and
+training hyperparameters are configured in
+`configs/sparse_reslim_forecasting.yaml`. If you are using a different system,
+update `data.data_dir` in that file.
 
 ### Run
 To run the forecasting example on one GPU:
@@ -404,11 +407,17 @@ sbatch examples/sparse_reslim_forecasting/launch.sh
 ```
 The launch script runs a 30-epoch, single-step 120-hour T2m forecast using a Sparse-Reslim keep ratio of 0.25.
 
+To use another forecasting configuration, set `CONFIG_PATH` when submitting:
+```
+CONFIG_PATH=/path/to/forecast.yaml sbatch examples/sparse_reslim_forecasting/launch.sh
+```
+
 For a quick sanity check:
 ```
 python examples/sparse_reslim_forecasting/train.py --smoke-test
-Full Sparse-Reslim Implementation
 ```
+
+### Full Sparse-Reslim Implementation
 
 ### Weather Forecasting Extension Work 
 This example is intended as a minimal demonstration of weather forecasting within the ORBIT-2 repository using the ORBIT-2 AI architecture innovation reslim and tiling algorithm. For additional weather forecasting implementation based on ORBIT-2, including:

@@ -23,15 +23,7 @@ mkdir -p "${MIOPEN_USER_DB_PATH}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-ERA5_DIR="${ERA5_DIR:-/lustre/orion/world-shared/lrn036/jyc/frontier/ClimaX-v2/data/ERA5-1hr-superres/1.0_deg/}"
+CONFIG_PATH="${CONFIG_PATH:-${REPO_ROOT}/configs/sparse_reslim_forecasting.yaml}"
 
 cd "${REPO_ROOT}"
-srun python examples/sparse_reslim_forecasting/train.py "${ERA5_DIR}" \
-  --max-epochs 30 \
-  --batch-size 1 \
-  --pred-range 120 \
-  --input-vars 2m_temperature \
-  --output-vars 2m_temperature \
-  --keep-ratio 0.25 \
-  --accelerator gpu \
-  --devices 1
+srun python examples/sparse_reslim_forecasting/train.py "${CONFIG_PATH}"

@@ -12,8 +12,10 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 try:
+    from .config import ConfigError, load_forecast_config
     from .model import SparseReslim
 except ImportError:  # Support `python examples/.../train.py` from the repo root.
+    from config import ConfigError, load_forecast_config
     from model import SparseReslim
 
 
@@ -292,36 +294,26 @@ def run_training(args) -> None:
     trainer.test(module, dataloaders=loader(test_dataset), ckpt_path="best")
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Minimal Sparse-Reslim deterministic ERA5 forecasting example"
     )
-    parser.add_argument("era5_dir", nargs="?", type=Path)
+    parser.add_argument(
+        "config",
+        nargs="?",
+        type=Path,
+        help="STORM-style YAML configuration file",
+    )
     parser.add_argument("--smoke-test", action="store_true")
-    parser.add_argument("--input-vars", nargs="+", default=["2m_temperature"])
-    parser.add_argument("--output-vars", nargs="+", default=["2m_temperature"])
-    parser.add_argument("--history", type=int, default=1)
-    parser.add_argument("--window", type=int, default=1)
-    parser.add_argument("--pred-range", type=int, default=6)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--max-epochs", type=int, default=30)
-    parser.add_argument("--patience", type=int, default=5)
-    parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-5)
-    parser.add_argument("--patch-size", type=int, default=2)
-    parser.add_argument("--embed-dim", type=int, default=128)
-    parser.add_argument("--depth", type=int, default=6)
-    parser.add_argument("--num-heads", type=int, default=4)
-    parser.add_argument("--keep-ratio", type=float, default=0.25)
-    parser.add_argument("--num-dense-early", type=int, default=1)
-    parser.add_argument("--num-sparse-middle", type=int, default=4)
-    parser.add_argument("--accelerator", choices=["auto", "cpu", "gpu"], default="auto")
-    parser.add_argument("--devices", type=int, default=1)
-    parser.add_argument("--limit-train-batches", type=int)
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs/sparse_reslim_forecasting"))
-    parser.add_argument("--seed", type=int, default=0)
-    return parser.parse_args()
+    cli_args = parser.parse_args(argv)
+    if cli_args.smoke_test:
+        return cli_args
+    if cli_args.config is None:
+        parser.error("CONFIG is required unless --smoke-test is used")
+    try:
+        return load_forecast_config(cli_args.config)
+    except ConfigError as error:
+        parser.error(str(error))
 
 
 if __name__ == "__main__":

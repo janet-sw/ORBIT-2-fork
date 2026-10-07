@@ -1,0 +1,71 @@
+#-----------   TRAINER  -------------------------------------------------------
+trainer:
+  max_epochs: 30
+  checkpoint:
+  pretrain:
+  batch_size: 1
+  num_workers: 2
+  data_type: bfloat16
+  gpu_type: amd
+  train_loss: mse
+  patience: 5
+  accelerator: gpu
+  devices: 1
+  output_dir: outputs/sparse_reslim_forecasting
+  limit_train_batches:
+  seed: 0
+
+#----------  Parallelism and Efficient Computing -------------------------------
+parallelism:
+  fsdp: 1
+  simple_ddp: 1
+  tensor_par: 1
+  seq_par: 1
+
+#----------  TILES -------------------------------------------------------------
+tiling:
+  do_tiling: false
+  div: 1
+  overlap: 0
+
+#----------  Reslim Input Data Compression ------------------------------------
+# compress_ratio: 1 keeps the original input resolution. Ratios greater than 1
+# are reserved for the input-compression implementation.
+compression:
+  compress_ratio: 1
+
+# ---------------------------- MODEL -------------------------------------------
+model:
+  preset: sparse_reslim
+  lr: 5e-4
+  weight_decay: 1e-5
+  patch_size: 2
+  embed_dim: 128
+  depth: 6
+  num_heads: 4
+  mlp_ratio: 4.0
+  dropout: 0.0
+  keep_ratio: 0.25
+  num_dense_early: 1
+  num_sparse_middle: 4
+
+# ---------------------------- DATA --------------------------------------------
+data:
+  src:
+    ERA5_1: era5
+  pred_range:
+    ERA5_1: 120
+  history:
+    ERA5_1: 1
+  window:
+    ERA5_1: 1
+  data_dir:
+    ERA5_1: /lustre/orion/world-shared/lrn036/jyc/frontier/ClimaX-v2/data/ERA5-1hr-superres/1.0_deg/
+  default_vars:
+    - 2m_temperature
+  dict_in_variables:
+    ERA5_1:
+      - 2m_temperature
+  dict_out_variables:
+    ERA5_1:
+      - 2m_temperature
