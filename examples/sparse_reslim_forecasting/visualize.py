@@ -22,8 +22,10 @@ try:
         _build_model,
         _infer_image_size,
         _load_checkpoint,
+        _resolve_model_image_size,
         _select_device,
     )
+    from .tiling import build_tile_specs, extract_tile, stitch_tiles
     from .utils import seed_everything
 except ImportError:  # Support `python examples/.../visualize.py`.
     from config import ConfigError, load_forecast_config
@@ -33,8 +35,10 @@ except ImportError:  # Support `python examples/.../visualize.py`.
         _build_model,
         _infer_image_size,
         _load_checkpoint,
+        _resolve_model_image_size,
         _select_device,
     )
+    from tiling import build_tile_specs, extract_tile, stitch_tiles
     from utils import seed_everything
 
 
@@ -132,6 +136,20 @@ def _plot_forecast(
     plt.close(figure)
 
 
+def _forecast_full_image(model, inputs, config):
+    if not config.tiling["do_tiling"]:
+        return model(inputs)
+
+    image_size = tuple(inputs.shape[-2:])
+    specs = build_tile_specs(
+        image_size,
+        config.tiling["div"],
+        config.tiling["overlap"],
+    )
+    predictions = [model(extract_tile(inputs, spec)) for spec in specs]
+    return stitch_tiles(predictions, specs, image_size)
+
+
 def create_visualization(
     config,
     *,
@@ -151,14 +169,15 @@ def create_visualization(
     device = _select_device(accelerator or config.accelerator)
     dataset, (inputs, targets) = _load_sample(config, split, sample_index)
     image_size = _infer_image_size(config.era5_dir, config.input_vars[0])
-    model = _build_model(config, image_size).to(device)
+    model_image_size = _resolve_model_image_size(image_size, config.tiling)
+    model = _build_model(config, model_image_size).to(device)
     _load_checkpoint(checkpoint_path.expanduser().resolve(), model)
     model.eval()
 
     input_batch = inputs.unsqueeze(0).to(device)
     target_batch = targets.unsqueeze(0).to(device)
     with torch.inference_mode(), _autocast_context(device, config.data_type):
-        forecast = model(input_batch)
+        forecast = _forecast_full_image(model, input_batch, config)
 
     output_index = config.output_vars.index(variable)
     input_index = config.input_vars.index(variable)
@@ -201,7 +220,8 @@ def create_visualization(
     print(
         f"input={tuple(input_batch.shape)} target={tuple(target_batch.shape)} "
         f"prediction={tuple(forecast.shape)} normalized_mse={normalized_mse:.6f} "
-        f"native_rmse={native_rmse:.4f}",
+        f"native_rmse={native_rmse:.4f} "
+        f"tiles={config.tiling['div'] ** 2 if config.tiling['do_tiling'] else 1}",
         flush=True,
     )
     return {"normalized_mse": normalized_mse, "native_rmse": native_rmse}

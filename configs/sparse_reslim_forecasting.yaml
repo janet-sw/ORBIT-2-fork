@@ -25,10 +25,11 @@ parallelism:
   seq_par: 1
 
 #----------  TILES -------------------------------------------------------------
+# div and overlap are ready for the 180 x 360 grid; toggle do_tiling to enable.
 tiling:
   do_tiling: false
-  div: 1
-  overlap: 0
+  div: 2
+  overlap: 2
 
 #----------  Reslim Input Data Compression ------------------------------------
 # Independent from middle-layer token dropping below. When enabled, the input

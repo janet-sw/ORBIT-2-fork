@@ -25,8 +25,9 @@ parallelism:
 
 tiling:
   do_tiling: false
-  div: 1
-  overlap: 0
+  # Produces 96 x 192 tiles, compatible with ratio 3 and patch_size 4.
+  div: 2
+  overlap: 6
 
 compression:
   enabled: false

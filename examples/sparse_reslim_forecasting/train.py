@@ -15,10 +15,12 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 try:
     from .config import ConfigError, load_forecast_config
     from .model import SparseReslim
+    from .tiling import build_tile_specs, extract_tile, stitch_tiles
     from .utils import seed_everything
 except ImportError:  # Support `python examples/.../train.py` from the repo root.
     from config import ConfigError, load_forecast_config
     from model import SparseReslim
+    from tiling import build_tile_specs, extract_tile, stitch_tiles
     from utils import seed_everything
 
 
@@ -42,8 +44,14 @@ def _load_normalization(root: Path, variables: tuple[str, ...]):
             "Expected normalize_mean.npz and normalize_std.npz in the ERA5 root"
         )
     with np.load(means_path) as mean_file, np.load(stds_path) as std_file:
-        means = {name: float(np.asarray(mean_file[name]).reshape(-1)[0]) for name in variables}
-        stds = {name: float(np.asarray(std_file[name]).reshape(-1)[0]) for name in variables}
+        means = {
+            name: float(np.asarray(mean_file[name]).reshape(-1)[0])
+            for name in variables
+        }
+        stds = {
+            name: float(np.asarray(std_file[name]).reshape(-1)[0])
+            for name in variables
+        }
     if any(value == 0 for value in stds.values()):
         raise ValueError("normalization standard deviations must be non-zero")
     return means, stds
@@ -63,6 +71,9 @@ class ERA5ForecastDataset(IterableDataset):
         window: int,
         pred_range: int,
         shuffle_files: bool,
+        do_tiling: bool = False,
+        tile_div: int = 1,
+        tile_overlap: int = 0,
     ) -> None:
         super().__init__()
         self.files = sorted((root / split).glob("*.npz"))
@@ -76,6 +87,9 @@ class ERA5ForecastDataset(IterableDataset):
         self.window = window
         self.pred_range = pred_range
         self.shuffle_files = shuffle_files
+        self.do_tiling = do_tiling
+        self.tile_div = tile_div
+        self.tile_overlap = tile_overlap
 
     def __iter__(self):
         files = list(self.files)
@@ -127,9 +141,21 @@ class ERA5ForecastDataset(IterableDataset):
                     ],
                     axis=0,
                 )
-                yield torch.from_numpy(inputs.astype(np.float32)), torch.from_numpy(
-                    targets.astype(np.float32)
+                input_tensor = torch.from_numpy(inputs.astype(np.float32))
+                target_tensor = torch.from_numpy(targets.astype(np.float32))
+                if not self.do_tiling:
+                    yield input_tensor, target_tensor
+                    continue
+
+                specs = build_tile_specs(
+                    tuple(input_tensor.shape[-2:]),
+                    self.tile_div,
+                    self.tile_overlap,
                 )
+                for spec in specs:
+                    yield extract_tile(input_tensor, spec), extract_tile(
+                        target_tensor, spec
+                    )
 
 
 def _infer_image_size(root: Path, variable: str) -> tuple[int, int]:
@@ -160,6 +186,15 @@ def _build_model(args, img_size: tuple[int, int]) -> SparseReslim:
         compress_ratio=args.compression["compress_ratio"],
         dropout=args.dropout,
     )
+
+
+def _resolve_model_image_size(
+    image_size: tuple[int, int], tiling
+) -> tuple[int, int]:
+    if not tiling["do_tiling"]:
+        return image_size
+    specs = build_tile_specs(image_size, tiling["div"], tiling["overlap"])
+    return specs[0].shape
 
 
 def _select_device(accelerator: str) -> torch.device:
@@ -302,6 +337,56 @@ def run_smoke_test() -> None:
             f"train_mse={train_mse:.4f}",
         )
 
+    full_inputs = torch.randn(1, 1, 1, 12, 24, device=device)
+    full_targets = torch.randn(1, 1, 12, 24, device=device)
+    specs = build_tile_specs((12, 24), div=2, overlap=2)
+    identity_tiles = [extract_tile(full_inputs, spec) for spec in specs]
+    assert torch.equal(stitch_tiles(identity_tiles, specs, (12, 24)), full_inputs)
+
+    tiled_model = SparseReslim(
+        variables=("2m_temperature",),
+        output_variables=("2m_temperature",),
+        img_size=specs[0].shape,
+        patch_size=2,
+        embed_dim=32,
+        depth=4,
+        num_heads=4,
+        keep_ratio=0.25,
+        num_dense_early=1,
+        num_sparse_middle=2,
+        token_dropping=True,
+        compression_enabled=True,
+        compress_ratio=2,
+    ).to(device)
+    optimizer = torch.optim.AdamW(tiled_model.parameters(), lr=1e-3)
+    tile_batches = [
+        (extract_tile(full_inputs, spec), extract_tile(full_targets, spec))
+        for spec in specs
+    ]
+    train_mse = _run_epoch(
+        tiled_model,
+        tile_batches,
+        device,
+        "float32",
+        optimizer=optimizer,
+    )
+    tiled_model.eval()
+    with torch.no_grad():
+        predictions = [
+            tiled_model(extract_tile(full_inputs, spec)) for spec in specs
+        ]
+    stitched = stitch_tiles(predictions, specs, (12, 24))
+    assert stitched.shape == full_targets.shape
+    assert tiled_model.last_sparse_token_count == 2
+    print(
+        "TILES smoke test passed:",
+        f"tiles={len(specs)},",
+        f"tile_shape={specs[0].shape},",
+        f"stitched={tuple(stitched.shape)},",
+        "compression=on, token_dropping=on,",
+        f"train_mse={train_mse:.4f}",
+    )
+
 
 def run_training(args) -> None:
     if args.devices != 1:
@@ -312,7 +397,11 @@ def run_training(args) -> None:
     device = _select_device(args.accelerator)
     seed_everything(args.seed)
     root = args.era5_dir.expanduser().resolve()
-    img_size = _infer_image_size(root, args.input_vars[0])
+    full_img_size = _infer_image_size(root, args.input_vars[0])
+    try:
+        img_size = _resolve_model_image_size(full_img_size, args.tiling)
+    except ValueError as error:
+        raise SystemExit(f"Invalid TILES configuration: {error}") from error
     compress_ratio = (
         args.compression["compress_ratio"] if args.compression["enabled"] else 1
     )
@@ -341,6 +430,9 @@ def run_training(args) -> None:
         history=args.history,
         window=args.window,
         pred_range=args.pred_range,
+        do_tiling=args.tiling["do_tiling"],
+        tile_div=args.tiling["div"],
+        tile_overlap=args.tiling["overlap"],
     )
     train_dataset = ERA5ForecastDataset(
         split="train", shuffle_files=True, **common_dataset_args
@@ -389,6 +481,9 @@ def run_training(args) -> None:
         active_tokens = max(1, int(network.num_patches * args.keep_ratio))
     print(
         f"Training on {device} with native PyTorch | "
+        f"tiling={'on' if args.tiling['do_tiling'] else 'off'} "
+        f"(div={args.tiling['div']}, overlap={args.tiling['overlap']}, "
+        f"tile={img_size}) | "
         f"compression={'on' if args.compression['enabled'] else 'off'} "
         f"(ratio={compress_ratio}) | "
         f"token_dropping={'on' if args.token_dropping else 'off'} "

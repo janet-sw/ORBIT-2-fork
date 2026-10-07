@@ -223,6 +223,8 @@ def load_forecast_config(path: str | os.PathLike[str]) -> ForecastConfig:
             allow_zero=True,
         ),
     }
+    if do_tiling and validated_tiling["div"] == 1:
+        raise ConfigError("tiling.div must be greater than 1 when tiling is enabled")
     compression_enabled = _boolean(
         _required(compression, "enabled", "compression"),
         "compression.enabled",

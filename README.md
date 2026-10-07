@@ -416,6 +416,12 @@ method alone, both together, or the dense baseline. Use a separate
 `trainer.output_dir` for each architecture because their checkpoints are not
 interchangeable.
 
+TILES is controlled by `tiling.do_tiling`, `tiling.div`, and
+`tiling.overlap`. Training streams the overlapping tiles as samples; inference
+processes every tile and crops the overlap before stitching a full-resolution
+forecast. The YAML values are chosen so enabling the switch is compatible with
+the configured ERA5 grid, compression ratio, and patch size.
+
 To use another forecasting configuration, set `CONFIG_PATH` when submitting:
 ```
 CONFIG_PATH=/path/to/forecast.yaml sbatch examples/sparse_reslim_forecasting/launch.sh
