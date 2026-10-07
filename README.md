@@ -426,6 +426,15 @@ For a quick sanity check:
 python examples/sparse_reslim_forecasting/train.py --smoke-test
 ```
 
+After training, visualize one test forecast together with its input, target,
+and signed error on Frontier:
+```
+CONFIG_PATH=configs/sparse_reslim_forecasting_smoke.yaml \
+  sbatch examples/sparse_reslim_forecasting/launch_visualize.sh
+```
+The figure is saved under
+`outputs/sparse_reslim_forecasting_smoke/visualizations/` by default.
+
 ### Full Sparse-Reslim Implementation
 
 ### Weather Forecasting Extension Work 
